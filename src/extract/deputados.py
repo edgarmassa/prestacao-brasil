@@ -1,55 +1,89 @@
 import os
 import requests
 import pandas as pd
-from datetime import datetime
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
 
-API_URL = "https://dadosabertos.camara.leg.br/api/v2/deputados"
-RAW_PATH = "data/raw"
+# ===============================
+# ENV
+# ===============================
+load_dotenv()
+
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+# ===============================
+# CONFIG
+# ===============================
+API_BASE_URL = "https://dadosabertos.camara.leg.br/api/v2"
+ITENS_POR_PAGINA = 100
+SCHEMA = "bronze"
+TABLE = "deputados"
+INDEX_NAME = "idx_bronze_deputados_id"
 
 
-def extract_all_deputados():
-    all_data = []
-    url = API_URL
-    params = {"itens": 100}  # máximo permitido
+# ===============================
+# FUNÇÕES API
+# ===============================
+def get_all_deputados():
+    url = f"{API_BASE_URL}/deputados"
+    params = {"itens": ITENS_POR_PAGINA}
+    deputados = []
 
     while url:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
 
-        payload = response.json()
-        all_data.extend(payload["dados"])
+        payload = resp.json()
+        deputados.extend(payload.get("dados", []))
 
-        # procura o link da próxima página
         next_url = None
         for link in payload.get("links", []):
             if link.get("rel") == "next":
                 next_url = link.get("href")
 
         url = next_url
-        params = None  # parâmetros só na primeira chamada
+        params = None
 
-    df = pd.DataFrame(all_data)
-    return df
-
-
-def save_parquet(df: pd.DataFrame):
-    os.makedirs(RAW_PATH, exist_ok=True)
-
-    ref_date = datetime.now().strftime("%Y%m%d")
-    file_path = f"{RAW_PATH}/deputados_{ref_date}.parquet"
-
-    df.to_parquet(file_path, index=False)
-
-    print(f"💾 Arquivo salvo em: {file_path}")
+    return deputados
 
 
+# ===============================
+# MAIN
+# ===============================
 if __name__ == "__main__":
-    print("🔹 Iniciando extração COMPLETA de deputados...")
+    print("🔹 Iniciando ingestão de deputados")
 
-    df = extract_all_deputados()
+    deputados = get_all_deputados()
+    print(f"👤 Total de deputados: {len(deputados)}")
 
-    print("✅ Extração concluída")
-    print(f"🔢 Total de registros: {len(df)}")
-    print(df.head())
+    df = pd.DataFrame(deputados)
 
-    save_parquet(df)
+    engine = create_engine(
+        f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    )
+
+    with engine.begin() as conn:
+        print("🔹 Garantindo schema bronze...")
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
+
+        print("🔹 Gravando deputados no PostgreSQL...")
+        df.to_sql(
+            TABLE,
+            conn,
+            schema=SCHEMA,
+            if_exists="replace",
+            index=False,
+            chunksize=1_000
+        )
+
+        print("🔹 Criando índice em bronze.deputados(id)...")
+        conn.execute(text(f"""
+            CREATE INDEX IF NOT EXISTS {INDEX_NAME}
+            ON {SCHEMA}.{TABLE} (id)
+        """))
+
+    print("✅ Ingestão de deputados concluída com sucesso")
